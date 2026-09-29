@@ -159,16 +159,75 @@ class RecipeVersionUpdate(BaseModel):
         return self
 
 
+class RuleSetCreate(BaseModel):
+    code: str
+    jurisdiction: str
+    name: Optional[str] = Field(default=None, min_length=1, max_length=255)
+
+    @field_validator("code")
+    @classmethod
+    def _norm_code(cls, v: str) -> str:
+        return normalize_code(v)
+
+    @field_validator("jurisdiction")
+    @classmethod
+    def _norm_jurisdiction(cls, v: str) -> str:
+        return normalize_jurisdiction(v)
+
+
+class RuleSetRule(BaseModel):
+    """One rule inside a rule-set draft submission."""
+
+    code: str
+    allergen: str
+    threshold: float = Field(ge=0)
+    unit: str
+    action: Literal["declare", "warning", "prohibit"]
+    applies_to: Literal["contains", "cross_contact"]
+
+    @field_validator("code", "allergen")
+    @classmethod
+    def _norm_code(cls, v: str) -> str:
+        return normalize_code(v)
+
+    @field_validator("unit")
+    @classmethod
+    def _check_unit(cls, v: str) -> str:
+        v = v.strip()
+        if v not in CONCENTRATION_TO_PPM:
+            raise ValueError(
+                f"unknown concentration unit: {v!r}; supported: {sorted(CONCENTRATION_TO_PPM)}"
+            )
+        return v
+
+
+class RuleSetSubmit(BaseModel):
+    """Full replacement of a rule-set draft, guarded by base_version (optimistic lock)."""
+
+    base_version: int = Field(ge=0)
+    rules: list[RuleSetRule] = []
+
+
+class RuleSetPublish(BaseModel):
+    """Publishing is also an optimistic-locked write, so it carries base_version."""
+
+    base_version: int = Field(ge=0)
+
+
 class EvaluationRequest(BaseModel):
     recipe_code: str
     recipe_version: int = Field(ge=1)
     jurisdiction: str
     idempotency_key: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    # Optional explicit binding to an immutable rule-set snapshot. Both fields
+    # must be supplied together; the referenced version must be published.
+    rule_set_code: Optional[str] = None
+    rule_set_version: Optional[int] = Field(default=None, ge=1)
 
-    @field_validator("recipe_code")
+    @field_validator("recipe_code", "rule_set_code")
     @classmethod
-    def _norm_code(cls, v: str) -> str:
-        return normalize_code(v)
+    def _norm_code(cls, v: Optional[str]) -> Optional[str]:
+        return normalize_code(v) if v is not None else None
 
     @field_validator("jurisdiction")
     @classmethod

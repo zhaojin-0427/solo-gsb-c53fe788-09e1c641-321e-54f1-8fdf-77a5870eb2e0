@@ -10,8 +10,8 @@ from sqlalchemy.orm import Session
 from ..db import get_db
 from ..errors import api_error
 from ..models import Evaluation
-from ..schemas import EvaluationRequest
-from ..services.evaluation import evaluate_recipe
+from ..schemas import EvaluationRequest, normalize_code
+from ..services.evaluation import evaluate_recipe, resolve_rule_set_binding
 
 router = APIRouter(prefix="/evaluations", tags=["evaluations"])
 
@@ -38,8 +38,11 @@ def create_evaluation(
 ):
     """Evaluate a published recipe version against a jurisdiction.
 
-    Idempotent: the same idempotency key + same request body replays the
-    stored result; the same key with a different body is a conflict.
+    Optionally bind the request to an immutable rule-set version
+    (``rule_set_code`` + ``rule_set_version``); every replay then reuses that
+    exact rule snapshot. Idempotent: the same idempotency key + same request
+    body replays the stored result; the same key with a different body is a
+    conflict.
     """
     key = body.idempotency_key or idempotency_key
     if not key:
@@ -60,7 +63,12 @@ def create_evaluation(
             )
         return JSONResponse(content=_serialize(existing, replayed=True), status_code=200)
 
-    result = evaluate_recipe(db, body.recipe_code, body.recipe_version, body.jurisdiction)
+    binding = resolve_rule_set_binding(
+        db, body.rule_set_code, body.rule_set_version, body.jurisdiction
+    )
+    result = evaluate_recipe(
+        db, body.recipe_code, body.recipe_version, body.jurisdiction, binding=binding
+    )
 
     ev = Evaluation(
         id=uuid.uuid4(),
@@ -69,6 +77,9 @@ def create_evaluation(
         recipe_code=body.recipe_code,
         recipe_version=body.recipe_version,
         jurisdiction=body.jurisdiction,
+        rule_set_code=binding.code if binding else None,
+        rule_set_version=binding.version if binding else None,
+        rule_set_digest=binding.digest if binding else None,
         status="completed",
         result=result,
     )
@@ -94,13 +105,32 @@ def create_evaluation(
 def list_evaluations(
     recipe_code: str | None = None,
     idempotency_key: str | None = None,
+    rule_set_code: str | None = None,
+    rule_set_version: int | None = None,
     db: Session = Depends(get_db),
 ):
+    """List evaluations; filter by recipe, idempotency key or rule-set version.
+
+    Filtering by rule-set version requires ``rule_set_code`` as well.
+    """
     q = db.query(Evaluation).order_by(Evaluation.created_at, Evaluation.id)
     if recipe_code:
         q = q.filter(Evaluation.recipe_code == recipe_code.strip().lower())
     if idempotency_key:
         q = q.filter(Evaluation.idempotency_key == idempotency_key)
+    if rule_set_version is not None:
+        if not rule_set_code:
+            raise api_error(
+                400,
+                "RULE_SET_BINDING_INCOMPLETE",
+                "rule_set_code is required when filtering by rule_set_version",
+            )
+        q = q.filter(
+            Evaluation.rule_set_code == normalize_code(rule_set_code),
+            Evaluation.rule_set_version == rule_set_version,
+        )
+    elif rule_set_code:
+        q = q.filter(Evaluation.rule_set_code == normalize_code(rule_set_code))
     return [_serialize(ev, replayed=False) for ev in q.all()]
 
 
