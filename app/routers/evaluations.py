@@ -12,6 +12,7 @@ from ..errors import api_error
 from ..models import Evaluation
 from ..schemas import EvaluationRequest
 from ..services.evaluation import evaluate_recipe
+from ..services.rule_sets import resolve_binding
 
 router = APIRouter(prefix="/evaluations", tags=["evaluations"])
 
@@ -36,7 +37,12 @@ def create_evaluation(
     db: Session = Depends(get_db),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ):
-    """Evaluate a published recipe version against a jurisdiction.
+    """Evaluate a published recipe version.
+
+    Without a ``rule_set_code``/``rule_set_version`` binding the published
+    standalone rules of the jurisdiction are used (legacy behavior). With a
+    binding the verdict is computed against that immutable rule-set snapshot,
+    so replaying the request always replays the same rules.
 
     Idempotent: the same idempotency key + same request body replays the
     stored result; the same key with a different body is a conflict.
@@ -60,7 +66,28 @@ def create_evaluation(
             )
         return JSONResponse(content=_serialize(existing, replayed=True), status_code=200)
 
-    result = evaluate_recipe(db, body.recipe_code, body.recipe_version, body.jurisdiction)
+    binding = None
+    if body.rule_set_code is not None:
+        # Stable errors for missing / unpublished rule-set bindings.
+        _, snapshot = resolve_binding(
+            db, body.rule_set_code, body.rule_set_version, body.jurisdiction
+        )
+        binding = {
+            "code": body.rule_set_code,
+            "version": body.rule_set_version,
+            "rules": snapshot.rules,
+        }
+
+    result = evaluate_recipe(
+        db,
+        body.recipe_code,
+        body.recipe_version,
+        body.jurisdiction,
+        binding=binding,
+    )
+    if binding is not None:
+        # Persist the summary with the verdict for fixed replay by evaluation ID.
+        result["rule_set"]["summary"] = snapshot.summary
 
     ev = Evaluation(
         id=uuid.uuid4(),
@@ -69,6 +96,8 @@ def create_evaluation(
         recipe_code=body.recipe_code,
         recipe_version=body.recipe_version,
         jurisdiction=body.jurisdiction,
+        rule_set_code=body.rule_set_code,
+        rule_set_version=body.rule_set_version,
         status="completed",
         result=result,
     )
@@ -94,6 +123,8 @@ def create_evaluation(
 def list_evaluations(
     recipe_code: str | None = None,
     idempotency_key: str | None = None,
+    rule_set_code: str | None = None,
+    rule_set_version: int | None = None,
     db: Session = Depends(get_db),
 ):
     q = db.query(Evaluation).order_by(Evaluation.created_at, Evaluation.id)
@@ -101,6 +132,10 @@ def list_evaluations(
         q = q.filter(Evaluation.recipe_code == recipe_code.strip().lower())
     if idempotency_key:
         q = q.filter(Evaluation.idempotency_key == idempotency_key)
+    if rule_set_code:
+        q = q.filter(Evaluation.rule_set_code == rule_set_code.strip().lower())
+    if rule_set_version is not None:
+        q = q.filter(Evaluation.rule_set_version == rule_set_version)
     return [_serialize(ev, replayed=False) for ev in q.all()]
 
 

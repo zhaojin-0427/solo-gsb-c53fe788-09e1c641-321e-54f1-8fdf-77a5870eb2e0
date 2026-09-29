@@ -31,7 +31,41 @@ def _classify(action: str, entry: dict, obligations: list, warnings: list, viola
         violations.append(entry)
 
 
-def evaluate_recipe(db: Session, recipe_code: str, recipe_version: int, jurisdiction: str) -> dict:
+def _load_rules(db: Session, jurisdiction: str) -> list[dict]:
+    """Legacy behavior: all published standalone rules of a jurisdiction."""
+    rows = (
+        db.query(Rule)
+        .filter(Rule.jurisdiction == jurisdiction, Rule.status == "published")
+        .order_by(Rule.code)
+        .all()
+    )
+    return [
+        {
+            "code": rule.code,
+            "allergen": rule.allergen,
+            "threshold_ppm": concentration_to_ppm(rule.threshold, rule.unit),
+            "action": rule.action,
+            "applies_to": rule.applies_to,
+        }
+        for rule in rows
+    ]
+
+
+def evaluate_recipe(
+    db: Session,
+    recipe_code: str,
+    recipe_version: int,
+    jurisdiction: str,
+    binding: dict | None = None,
+) -> dict:
+    """Evaluate a published recipe version.
+
+    When ``binding`` is ``None`` the published standalone rules of the
+    jurisdiction are used (legacy behavior). Otherwise ``binding`` is an
+    immutable rule-set snapshot ``{"code", "version", "rules"}`` and only that
+    frozen rule list is applied, so replaying the binding always reproduces the
+    same verdict.
+    """
     recipe = db.query(Recipe).filter(Recipe.code == recipe_code).first()
     if recipe is None:
         raise api_error(
@@ -118,12 +152,13 @@ def evaluate_recipe(db: Session, recipe_code: str, recipe_version: int, jurisdic
     for paths in list(contains_paths.values()) + list(cross_paths.values()):
         paths.sort(key=lambda p: ("/".join(p["path"]), p["ingredient"]))
 
-    rules = (
-        db.query(Rule)
-        .filter(Rule.jurisdiction == jurisdiction, Rule.status == "published")
-        .order_by(Rule.code)
-        .all()
-    )
+    if binding is None:
+        rules = _load_rules(db, jurisdiction)
+        rule_set_block: dict | None = None
+    else:
+        # Replay against the frozen snapshot; standalone rules are ignored.
+        rules = sorted(binding["rules"], key=lambda r: r["code"])
+        rule_set_block = {"code": binding["code"], "version": binding["version"]}
 
     obligations: list[dict] = []
     warnings: list[dict] = []
@@ -131,39 +166,39 @@ def evaluate_recipe(db: Session, recipe_code: str, recipe_version: int, jurisdic
     regulated: set[str] = set()
 
     for rule in rules:
-        threshold_ppm = concentration_to_ppm(rule.threshold, rule.unit)
-        if rule.applies_to == "contains":
-            mass = contains_mass.get(rule.allergen)
+        threshold_ppm = rule["threshold_ppm"]
+        if rule["applies_to"] == "contains":
+            mass = contains_mass.get(rule["allergen"])
             if mass is None:
                 continue
-            regulated.add(rule.allergen)
+            regulated.add(rule["allergen"])
             conc_ppm = mass / total * 1e6
             if conc_ppm < threshold_ppm:
                 continue
             entry = {
-                "allergen": rule.allergen,
-                "rule_code": rule.code,
-                "action": rule.action,
+                "allergen": rule["allergen"],
+                "rule_code": rule["code"],
+                "action": rule["action"],
                 "source": "contains",
                 "threshold_ppm": _r6(threshold_ppm),
                 "concentration_ppm": _r6(conc_ppm),
-                "trigger_paths": contains_paths[rule.allergen],
+                "trigger_paths": contains_paths[rule["allergen"]],
             }
-            _classify(rule.action, entry, obligations, warnings, violations)
+            _classify(rule["action"], entry, obligations, warnings, violations)
         else:  # cross_contact
-            paths = cross_paths.get(rule.allergen)
+            paths = cross_paths.get(rule["allergen"])
             if not paths:
                 continue
-            regulated.add(rule.allergen)
+            regulated.add(rule["allergen"])
             entry = {
-                "allergen": rule.allergen,
-                "rule_code": rule.code,
-                "action": rule.action,
+                "allergen": rule["allergen"],
+                "rule_code": rule["code"],
+                "action": rule["action"],
                 "source": "cross_contact",
                 "threshold_ppm": _r6(threshold_ppm),
                 "trigger_paths": paths,
             }
-            _classify(rule.action, entry, obligations, warnings, violations)
+            _classify(rule["action"], entry, obligations, warnings, violations)
 
     sort_key = lambda e: (e["allergen"], e["rule_code"])  # noqa: E731
     obligations.sort(key=sort_key)
@@ -173,7 +208,7 @@ def evaluate_recipe(db: Session, recipe_code: str, recipe_version: int, jurisdic
     present = set(contains_mass) | set(cross_paths)
     unregulated = sorted(present - regulated)
 
-    return {
+    result = {
         "recipe": {"code": recipe_code, "version": recipe_version},
         "jurisdiction": jurisdiction,
         "status": "completed",
@@ -192,3 +227,6 @@ def evaluate_recipe(db: Session, recipe_code: str, recipe_version: int, jurisdic
         "violations": violations,
         "unregulated_allergens": unregulated,
     }
+    if rule_set_block is not None:
+        result["rule_set"] = rule_set_block
+    return result

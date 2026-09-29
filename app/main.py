@@ -4,15 +4,39 @@ from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from sqlalchemy import inspect, text
 
 from .db import Base, engine
-from .routers import evaluations, ingredients, recipes, rules
+from .routers import evaluations, ingredients, recipes, rule_sets, rules
 from .units import CONCENTRATION_TO_PPM, MASS_TO_GRAMS
+
+
+def _ensure_backfill_columns() -> None:
+    """Idempotent additive bootstrap for pre-existing databases.
+
+    ``create_all`` creates new tables (rule_sets*) but cannot add columns to an
+    existing table; older deployments would otherwise miss the snapshot-binding
+    columns on ``evaluations``.
+    """
+    inspector = inspect(engine)
+    if "evaluations" not in inspector.get_table_names():
+        return
+    existing = {column["name"] for column in inspector.get_columns("evaluations")}
+    statements = []
+    if "rule_set_code" not in existing:
+        statements.append("ALTER TABLE evaluations ADD COLUMN rule_set_code VARCHAR(64)")
+    if "rule_set_version" not in existing:
+        statements.append("ALTER TABLE evaluations ADD COLUMN rule_set_version INTEGER")
+    if statements:
+        with engine.begin() as conn:
+            for stmt in statements:
+                conn.execute(text(stmt))
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
+    _ensure_backfill_columns()
     yield
 
 
@@ -52,7 +76,15 @@ def root():
         "service": "food-allergen-compliance",
         "version": "1.0.0",
         "docs": "/docs",
-        "endpoints": ["/ingredients", "/rules", "/recipes", "/evaluations", "/units", "/health"],
+        "endpoints": [
+            "/ingredients",
+            "/rules",
+            "/rule-sets",
+            "/recipes",
+            "/evaluations",
+            "/units",
+            "/health",
+        ],
     }
 
 
@@ -71,5 +103,6 @@ def supported_units():
 
 app.include_router(ingredients.router)
 app.include_router(rules.router)
+app.include_router(rule_sets.router)
 app.include_router(recipes.router)
 app.include_router(evaluations.router)

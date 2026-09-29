@@ -45,6 +45,49 @@ for code in eu-gluten-declare eu-gluten-prohibit-20ppm eu-tree-nuts-declare eu-p
   curl -fsS -X POST "$BASE/rules/$code/publish" | j
 done
 
+echo "== 4b. traceable rule set: draft (ppm-normalized) -> conflicts -> immutable publish =="
+curl -fsS -X POST "$BASE/rule-sets" -H 'Content-Type: application/json' \
+  -d '{"code":"eu-2026","jurisdiction":"EU","name":"EU Allergens 2026"}' | j
+
+# thresholds use mixed units: 20000 ppb / 0.002% are both normalized to 20 ppm
+curl -fsS -X PUT "$BASE/rule-sets/eu-2026" -H 'Content-Type: application/json' -d '{
+  "base_version": 0,
+  "rules": [
+    {"code":"gluten-declare-0","allergen":"gluten","threshold":0,"unit":"ppm",
+     "action":"declare","applies_to":"contains"},
+    {"code":"gluten-warning-0","allergen":"gluten","threshold":0,"unit":"ppm",
+     "action":"warning","applies_to":"contains"},
+    {"code":"gluten-prohibit-20ppm","allergen":"gluten","threshold":20000,"unit":"ppb",
+     "action":"prohibit","applies_to":"contains"},
+    {"allergen":"tree_nuts","threshold":0,"unit":"ppm","action":"declare","applies_to":"contains"},
+    {"allergen":"peanut","threshold":0,"unit":"ppm","action":"warning","applies_to":"cross_contact"}
+  ]
+}' | j
+
+echo "-- stale base_version -> 409 VERSION_CONFLICT with current_version (no write) --"
+curl -sS -o /tmp/rs_conflict.json -w 'status=%{http_code}\n' \
+  -X PUT "$BASE/rule-sets/eu-2026" -H 'Content-Type: application/json' \
+  -d '{"base_version":0,"rules":[]}' || true
+cat /tmp/rs_conflict.json | j
+
+echo "-- publish v1 (declare+warning coexist; 20 ppm/0.002% are different allergens) --"
+curl -fsS -X POST "$BASE/rule-sets/eu-2026/publish" | j
+echo "-- republishing the same draft is idempotent (same version/digest) --"
+curl -fsS -X POST "$BASE/rule-sets/eu-2026/publish" \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print("version:", d["version"], "digest:", d["summary"]["digest"][:16])'
+
+echo "-- overlapping prohibit+declare at the same ppm -> publish rejected with details --"
+curl -fsS -X POST "$BASE/rule-sets" -H 'Content-Type: application/json' \
+  -d '{"code":"broken-set","jurisdiction":"EU"}' >/dev/null
+curl -fsS -X PUT "$BASE/rule-sets/broken-set" -H 'Content-Type: application/json' -d '{
+  "base_version": 0,
+  "rules": [
+    {"code":"p","allergen":"gluten","threshold":20,"unit":"ppm","action":"prohibit","applies_to":"contains"},
+    {"code":"d","allergen":"gluten","threshold":0.002,"unit":"%","action":"declare","applies_to":"contains"}
+  ]
+}' >/dev/null
+curl -sS -X POST "$BASE/rule-sets/broken-set/publish" | j || true
+
 echo "== 5. versioned nested recipe (cake v1 uses 400 g filling v1 + 1 kg wheat flour) =="
 curl -fsS -X POST "$BASE/recipes" -H 'Content-Type: application/json' \
   -d '{"code":"filling","name":"Almond Filling"}' | j
@@ -77,6 +120,29 @@ echo "== 7. replay with the same key -> 200 OK, replayed=true =="
 curl -fsS -o /dev/null -w 'status=%{http_code}\n' -X POST "$BASE/evaluations" \
   -H 'Content-Type: application/json' -H 'Idempotency-Key: cake-eu-v1-20260923' \
   -d '{"recipe_code":"cake","recipe_version":1,"jurisdiction":"EU"}'
+
+echo "== 7b. evaluate bound to the immutable rule-set v1 snapshot -> fixed replay =="
+curl -fsS -X POST "$BASE/evaluations" \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: cake-eu-rs1-20260929' \
+  -d '{"recipe_code":"cake","recipe_version":1,"jurisdiction":"EU",
+       "rule_set_code":"eu-2026","rule_set_version":1}' | j
+
+echo "-- binding a draft (unpublished) version -> 409 RULE_SET_NOT_PUBLISHED --"
+curl -fsS -X PUT "$BASE/rule-sets/eu-2026" -H 'Content-Type: application/json' -d '{
+  "base_version": 1,
+  "rules": [
+    {"code":"gluten-declare-0","allergen":"gluten","threshold":0,"unit":"ppm",
+     "action":"declare","applies_to":"contains"}
+  ]
+}' >/dev/null
+curl -sS -o /tmp/unpub.json -w 'status=%{http_code}\n' -X POST "$BASE/evaluations" \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: bad-binding' \
+  -d '{"recipe_code":"cake","recipe_version":1,"jurisdiction":"EU",
+       "rule_set_code":"eu-2026","rule_set_version":2}' || true
+cat /tmp/unpub.json | j
+
+echo "-- query by rule-set version: summary + recipe version + stored result, same snapshot --"
+curl -fsS "$BASE/rule-sets/eu-2026/versions/1/evaluations" | j
 
 echo "== 8. incomplete input -> minimal missing set (422) =="
 curl -fsS -X POST "$BASE/ingredients" -H 'Content-Type: application/json' \

@@ -102,6 +102,66 @@ class RecipeCreate(BaseModel):
         return normalize_code(v)
 
 
+class RuleSetEntry(BaseModel):
+    """One rule inside a rule-set draft. Thresholds are normalized to ppm on submit."""
+
+    code: Optional[str] = None
+    allergen: str
+    threshold: float = Field(ge=0)
+    unit: str
+    action: Literal["declare", "warning", "prohibit"]
+    applies_to: Literal["contains", "cross_contact"]
+
+    @field_validator("code", "allergen")
+    @classmethod
+    def _norm_code(cls, v: Optional[str]) -> Optional[str]:
+        return normalize_code(v) if v is not None else None
+
+    @field_validator("unit")
+    @classmethod
+    def _check_unit(cls, v: str) -> str:
+        v = v.strip()
+        if v not in CONCENTRATION_TO_PPM:
+            raise ValueError(
+                f"unknown concentration unit: {v!r}; supported: {sorted(CONCENTRATION_TO_PPM)}"
+            )
+        return v
+
+
+class RuleSetCreate(BaseModel):
+    code: str
+    jurisdiction: str
+    name: Optional[str] = Field(default=None, min_length=1, max_length=255)
+
+    @field_validator("code")
+    @classmethod
+    def _norm_code(cls, v: str) -> str:
+        return normalize_code(v)
+
+    @field_validator("jurisdiction")
+    @classmethod
+    def _norm_jurisdiction(cls, v: str) -> str:
+        return normalize_jurisdiction(v)
+
+
+class RuleSetSubmit(BaseModel):
+    """A draft submission. ``base_version`` is an optimistic-concurrency token."""
+
+    base_version: int = Field(ge=0)
+    rules: list[RuleSetEntry] = Field(default=list)
+
+    @model_validator(mode="after")
+    def _check_unique_codes(self):
+        seen: set[str] = set()
+        for entry in self.rules:
+            if entry.code is not None and entry.code in seen:
+                raise ValueError(f"duplicate rule code in rule set: {entry.code!r}")
+            if entry.code is not None:
+                seen.add(entry.code)
+        return self
+
+
+
 class RecipeItem(BaseModel):
     kind: Literal["ingredient", "recipe"]
     code: str
@@ -164,13 +224,24 @@ class EvaluationRequest(BaseModel):
     recipe_version: int = Field(ge=1)
     jurisdiction: str
     idempotency_key: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    # Optional explicit binding to an immutable rule-set snapshot.
+    rule_set_code: Optional[str] = None
+    rule_set_version: Optional[int] = Field(default=None, ge=1)
 
-    @field_validator("recipe_code")
+    @field_validator("recipe_code", "rule_set_code")
     @classmethod
-    def _norm_code(cls, v: str) -> str:
-        return normalize_code(v)
+    def _norm_code(cls, v: Optional[str]) -> Optional[str]:
+        return normalize_code(v) if v is not None else None
 
     @field_validator("jurisdiction")
     @classmethod
     def _norm_jurisdiction(cls, v: str) -> str:
         return normalize_jurisdiction(v)
+
+    @model_validator(mode="after")
+    def _check_binding(self):
+        if (self.rule_set_code is None) != (self.rule_set_version is None):
+            raise ValueError(
+                "rule_set_code and rule_set_version must be provided together"
+            )
+        return self

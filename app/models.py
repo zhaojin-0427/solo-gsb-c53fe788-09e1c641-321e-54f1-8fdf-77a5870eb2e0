@@ -47,6 +47,44 @@ class Rule(Base):
     published_at = sa.Column(sa.DateTime(timezone=True), nullable=True)
 
 
+class RuleSet(Base):
+    """A per-jurisdiction, optimistically-versioned draft of a traceable rule set."""
+
+    __tablename__ = "rule_sets"
+
+    id = sa.Column(sa.Uuid, primary_key=True, default=uuid.uuid4)
+    code = sa.Column(sa.String(64), unique=True, nullable=False, index=True)
+    jurisdiction = sa.Column(sa.String(32), nullable=False, index=True)
+    name = sa.Column(sa.String(255), nullable=True)
+    # 0 right after creation; incremented by every successful draft submission.
+    current_version = sa.Column(sa.Integer, nullable=False, default=0)
+    # ppm-normalized entries: [{"code", "allergen", "threshold_ppm",
+    #                          "action", "applies_to"}, ...]; null until first submit
+    draft_rules = sa.Column(JSON_TYPE, nullable=True)
+    created_at = sa.Column(sa.DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at = sa.Column(sa.DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class RuleSetVersion(Base):
+    """An immutable, published snapshot of a rule set with its traceability summary."""
+
+    __tablename__ = "rule_set_versions"
+    __table_args__ = (
+        sa.UniqueConstraint("rule_set_id", "version", name="uq_rule_set_version"),
+    )
+
+    id = sa.Column(sa.Uuid, primary_key=True, default=uuid.uuid4)
+    rule_set_id = sa.Column(
+        sa.Uuid, sa.ForeignKey("rule_sets.id"), nullable=False, index=True
+    )
+    version = sa.Column(sa.Integer, nullable=False)
+    rules = sa.Column(JSON_TYPE, nullable=False, default=list)
+    summary = sa.Column(JSON_TYPE, nullable=False, default=dict)
+    published_at = sa.Column(sa.DateTime(timezone=True), nullable=False, default=utcnow)
+
+    rule_set = sa.orm.relationship("RuleSet")
+
+
 class Recipe(Base):
     __tablename__ = "recipes"
 
@@ -92,6 +130,9 @@ class Evaluation(Base):
     recipe_code = sa.Column(sa.String(64), nullable=False)
     recipe_version = sa.Column(sa.Integer, nullable=False)
     jurisdiction = sa.Column(sa.String(32), nullable=False)
+    # Snapshot binding: both null for legacy jurisdiction-only evaluations.
+    rule_set_code = sa.Column(sa.String(64), nullable=True, index=True)
+    rule_set_version = sa.Column(sa.Integer, nullable=True)
     status = sa.Column(sa.String(16), nullable=False, default="completed")
     result = sa.Column(JSON_TYPE, nullable=False, default=dict)
     created_at = sa.Column(sa.DateTime(timezone=True), nullable=False, default=utcnow)
